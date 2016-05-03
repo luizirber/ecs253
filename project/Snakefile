@@ -1,0 +1,35 @@
+rule all:
+    input:
+      "outputs/galGal.21.unique",
+      "outputs/human.21.unique",
+      "outputs/mouse.21.unique"
+
+rule download_galGal:
+    output: "inputs/galGal.fa.gz"
+    shell: """
+        mkdir -p inputs
+        wget -c ftp://ftp.ncbi.nlm.nih.gov/genomes/all/GCA_000002315.3_Gallus_gallus-5.0/GCA_000002315.3_Gallus_gallus-5.0_genomic.fna.gz -O {output}
+    """
+
+rule download_human:
+    output: "inputs/human.fa.gz"
+    shell: """
+        mkdir -p inputs
+        wget -c ftp://ftp.ncbi.nlm.nih.gov/genomes/all/GCA_000001405.22_GRCh38.p7/GCA_000001405.22_GRCh38.p7_genomic.fna.gz -O {output}
+    """
+
+rule download_mouse:
+    output: "inputs/mouse.fa.gz"
+    shell: """
+        mkdir -p inputs
+        wget -c ftp://ftp.ncbi.nlm.nih.gov/genomes/all/GCA_000001635.6_GRCm38.p4/GCA_000001635.6_GRCm38.p4_genomic.fna.gz -O {output}
+    """
+
+rule unique_kmers:
+    output: "outputs/{organism}.{ksize}.unique"
+    input: "inputs/{organism}.fa.gz"
+    params: ksize="{ksize}"
+    threads: 4
+    shell: """
+        OMP_NUM_THREADS={threads} unique-kmers.py -k {params.ksize} -e 0.01 --report {output} {input}
+    """
