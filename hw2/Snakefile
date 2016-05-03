@@ -1,0 +1,204 @@
+from collections import Counter
+
+import networkx as nx
+import matplotlib
+import khmer
+import screed
+
+
+rule all:
+    input:
+      "outputs/ecoli.5.stats",
+      "outputs/ecoli.5.hierarchy.png",
+      "outputs/ecoli.5.community.png",
+      "outputs/ecoli.5.png",
+      "outputs/ecoli.5.unique"
+
+rule download_ecoli:
+    output: "inputs/ecoli.fa"
+    shell: """
+        mkdir -p inputs
+        wget -c 'http://www.ncbi.nlm.nih.gov/sviewer/viewer.cgi?tool=portal&sendto=on&log$=seqview&db=nuccore&dopt=fasta&sort=&val=545778205&from=begin&to=end&maxplex=1' -O {output}
+    """
+
+rule unique_kmers:
+    output: "outputs/{organism}.{ksize}.unique"
+    input: "inputs/{organism}.fa"
+    params: ksize="{ksize}"
+    threads: 4
+    shell: """
+        OMP_NUM_THREADS={threads} unique-kmers.py -k {params.ksize} -e 0.01 --report {output} {input}
+    """
+
+rule nx_graph:
+    output: graph="outputs/{organism}.{ksize}.gml"
+    input:
+        seqs="inputs/{organism}.fa",
+        cg="outputs/{organism}.{ksize}.cg"
+    params: ksize="{ksize}"
+    run:
+
+        TRANSLATE = {'A': 'T', 'C': 'G', 'T': 'A', 'G': 'C'}
+        def revcomp(kmer):
+            return "".join(TRANSLATE[c] for c in kmer[::-1])
+
+        def lex_rc(kmer):
+            rc = revcomp(kmer)
+            if kmer < rc:
+                return kmer
+            return rc
+
+        def kmers(seq, k):
+            for i in range(len(seq) - k):
+                yield seq[i:i+k]
+
+        def gstats(k, seqs, tablesize=1e6):
+            cg = khmer.load_countgraph(input.cg)
+
+            with open(seqs, 'r') as data:
+                g = nx.DiGraph()
+                for seq in screed.fasta.fasta_iter(data):
+                    for kmer in set(kmers(seq['sequence'], k)):
+                        kmerl = lex_rc(kmer)
+                        for nc in "ACGT":
+                            # right
+                            next_node = lex_rc(kmer[1:] + nc)
+                            weight_next = cg.get(next_node)
+                            if weight_next != 0:
+                                g.add_edge(kmerl, next_node)
+                                g.node[next_node]['weight'] = weight_next
+                                g.node[kmerl]['weight'] = cg.get(kmerl)
+
+                            #left
+                            next_node = lex_rc(nc + kmer[:-1])
+                            weight_next = cg.get(next_node)
+                            if weight_next != 0:
+                                g.add_edge(next_node, kmerl)
+                                g.node[next_node]['weight'] = weight_next
+                                g.node[kmerl]['weight'] = cg.get(kmerl)
+
+            total_mers = (4**k)/2
+            return g, (total_mers - cg.n_unique_kmers()) / total_mers
+
+        g, occ = gstats(int(params.ksize), input.seqs, 1e8)
+        nx.write_graphml(g, output.graph)
+
+rule nx_stats:
+    input: graph="outputs/{organism}.{ksize}.gml"
+    output: stats="outputs/{organism}.{ksize}.stats"
+    run:
+        g = nx.read_graphml(input.graph)
+        g.name = "Directed version"
+        gu = g.to_undirected()
+        gu.name = "Undirected version"
+        with open(output.stats, 'w') as stats:
+            stats.write(nx.info(g) + "\n\n")
+            stats.write(nx.info(gu) + "\n\n")
+
+rule load_into_counting:
+    output: cg="outputs/{organism}.{ksize}.cg"
+    input:
+        seqs="inputs/{organism}.fa",
+    params: ksize="{ksize}"
+    shell: """
+        load-into-counting.py -k {params.ksize} -N 4 --max-tablesize 1e8 {output.cg} {input.seqs}
+    """
+
+rule abundance_dist:
+    output: dist="outputs/{organism}.{ksize}.dist"
+    input:
+        seqs="inputs/{organism}.fa",
+        cg="outputs/{organism}.{ksize}.cg"
+    params: ksize="{ksize}"
+    shell: """
+        abundance-dist.py {input.cg}  {input.seqs} {output.dist}
+    """
+
+rule abundance_plot:
+    input: dist="outputs/{organism}.{ksize}.dist"
+    output: plot="outputs/{organism}.{ksize}.abundance.png"
+    shell: """
+        python scripts/plot-abundance-dist.py --ymax 100 {input.dist} {output.plot}
+    """
+
+rule plot_graph:
+    input: graph="outputs/{organism}.{ksize}.gml"
+    output: image="outputs/{organism}.{ksize}.png"
+    run:
+        import graph_tool as gt
+        import graph_tool.draw
+        g = gt.load_graph(input.graph, fmt="graphml")
+        weight = g.vertex_properties["weight"]
+
+        pos = gt.draw.arf_layout(g)
+        size = gt.draw.prop_to_size(weight, 1, 30)
+        gt.draw.graph_draw(g, pos, output_size=(1000, 1000), vertex_color=weight,
+                   vertex_fill_color=weight, vertex_size=size, edge_pen_width=1.2,
+                              vcmap=matplotlib.cm.gist_heat_r, output=output.image)
+
+rule community:
+    input: graph="outputs/{organism}.{ksize}.gml"
+    output: community="outputs/{organism}.{ksize}.community"
+    run:
+        import community
+        g = nx.read_graphml(input.graph)
+        partition = community.best_partition(g.to_undirected())
+        comm_sizes = Counter(partition.values())
+        num_comm = len(comm_sizes)
+
+rule community_gt:
+    input: graph="outputs/{organism}.{ksize}.gml"
+    output:
+        community="outputs/{organism}.{ksize}.community.yaml",
+        image="outputs/{organism}.{ksize}.community.png"
+    threads: 32
+    run:
+        import graph_tool as gt
+        import graph_tool.inference
+        import graph_tool.draw
+        import yaml
+        gt.openmp_set_num_threads(threads)
+        g = gt.load_graph(input.graph, fmt="graphml")
+        state = gt.inference.minimize_blockmodel_dl(g)
+        blocks = state.get_blocks()
+
+        weight = g.vertex_properties["weight"]
+
+        pos = gt.draw.arf_layout(g)
+        size = gt.draw.prop_to_size(weight, 1, 30)
+        state.draw(pos=pos, output_size=(1000, 1000), vertex_size=size,
+                   vertex_shape=blocks,
+                   edge_pen_width=1.2, output=output.image)
+        #gt.draw.draw_hierarchy(state, output=output.image)
+
+        arr = blocks.get_array()
+        comm_sizes = Counter(arr)
+        with open(output.community, 'w') as f:
+            yaml.safe_dump({'sizes': {int(k):int(v) for (k,v) in comm_sizes.items()},
+                            'blocks': [int(c) for c in arr]},
+                           f)
+
+rule hierarchy:
+    input: graph="outputs/{organism}.{ksize}.gml"
+    output:
+        community="outputs/{organism}.{ksize}.hierarchy.yaml",
+        image="outputs/{organism}.{ksize}.hierarchy.png"
+    threads: 32
+    run:
+        import graph_tool as gt
+        import graph_tool.inference
+        import graph_tool.draw
+        import yaml
+        gt.openmp_set_num_threads(threads)
+        g = gt.load_graph(input.graph, fmt="graphml")
+        state = gt.inference.minimize_nested_blockmodel_dl(g)
+
+        gt.draw.draw_hierarchy(state, output=output.image)
+
+        arr = state.get_bs()[0]
+        comm_sizes = Counter(arr)
+        with open(output.community, 'w') as f:
+            yaml.safe_dump({'sizes': {int(k):int(v) for (k,v) in comm_sizes.items()},
+                            'blocks': [int(c) for c in arr]},
+                           f)
+
