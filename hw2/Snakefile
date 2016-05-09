@@ -8,11 +8,13 @@ import screed
 
 rule all:
     input:
-      "outputs/ecoli.5.stats",
-      "outputs/ecoli.5.hierarchy.png",
-      "outputs/ecoli.5.community.png",
-      "outputs/ecoli.5.png",
-      "outputs/ecoli.5.unique"
+      expand([
+        "outputs/ecoli.{ksize}.stats",
+        "outputs/ecoli.{ksize}.hierarchy.png",
+        "outputs/ecoli.{ksize}.community.png",
+        "outputs/ecoli.{ksize}.png",
+        "outputs/ecoli.{ksize}.unique"],
+        ksize=[5,13])
 
 rule download_ecoli:
     output: "inputs/ecoli.fa"
@@ -202,3 +204,13 @@ rule hierarchy:
                             'blocks': [int(c) for c in arr]},
                            f)
 
+rule hw2a:
+    input: "hw2a.md"
+    output: "hw2a.pdf"
+    shell: """
+	pandoc -r markdown+simple_tables+table_captions+yaml_metadata_block \
+           -s -S --latex-engine=pdflatex \
+           --template=.pandoc/templates/latex.template \
+           --filter pandoc-citeproc --csl=.pandoc/csl/apsa.csl \
+           --bibliography=hw2a.bib -o {output} {input}
+    """
