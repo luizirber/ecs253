@@ -1,0 +1,32 @@
+from collections import Counter
+
+import networkx as nx
+import matplotlib
+import khmer
+import screed
+
+
+rule all:
+    input: "hw3a.pdf"
+
+rule hw3a:
+    input: 
+        "img/ecoli_5.png",
+        "img/ecoli_21.png",
+        "img/ecoli_31.png",
+        md="hw3a.md",
+
+    output: "hw3a.pdf"
+    shell: """
+    pandoc -r markdown+simple_tables+table_captions+yaml_metadata_block \
+           -s -S --latex-engine=pdflatex \
+           --template=.pandoc/templates/latex.template \
+           -o {output} {input.md}
+    """
+
+rule imgs:
+    input: "../project/outputs/gephi/ecoli.{ksize}.svg"
+    output: "img/ecoli_{ksize}.png"
+    shell: """
+        inkscape -z -f {input} -e {output} -w 1000 -b black
+    """
