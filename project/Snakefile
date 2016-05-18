@@ -1,8 +1,23 @@
+import networkx as nx
+import matplotlib
+import khmer
+import screed
+import gzip
+
 rule all:
     input:
-      "outputs/galGal.21.unique",
-      "outputs/human.21.unique",
-      "outputs/mouse.21.unique"
+      expand([
+          "outputs/cdbg/{organism}.{ksize}.gml.gz",
+          "outputs/{organism}.{ksize}.unique"],
+        ksize=[13,21,31],
+		organism=["galGal", "ecoli", "human", "mouse"])
+
+rule download_ecoli:
+    output: "inputs/ecoli.fa.gz"
+    shell: """
+        mkdir -p inputs
+        wget -qO - 'http://www.ncbi.nlm.nih.gov/sviewer/viewer.cgi?tool=portal&sendto=on&log$=seqview&db=nuccore&dopt=fasta&sort=&val=545778205&from=begin&to=end&maxplex=1' | gzip -c > {output}
+    """
 
 rule download_galGal:
     output: "inputs/galGal.fa.gz"
@@ -32,4 +47,116 @@ rule unique_kmers:
     threads: 4
     shell: """
         OMP_NUM_THREADS={threads} unique-kmers.py -k {params.ksize} -e 0.01 --report {output} {input}
+    """
+
+rule load_into_counting:
+    output: cg="outputs/{organism}.{ksize}.cg"
+    input:
+        seqs="inputs/{organism}.fa.gz",
+    params: ksize="{ksize}"
+    shell: """
+        load-into-counting.py -k {params.ksize} -N 4 --max-tablesize 2e9 {output.cg} {input.seqs}
+    """
+
+rule abundance_dist:
+    output: dist="outputs/{organism}.{ksize}.dist"
+    input:
+        seqs="inputs/{organism}.fa.gz",
+        cg="outputs/{organism}.{ksize}.cg"
+    params: ksize="{ksize}"
+    shell: """
+        abundance-dist.py {input.cg}  {input.seqs} {output.dist}
+    """
+
+rule abundance_plot:
+    input: dist="outputs/{organism}.{ksize}.dist"
+    output: plot="outputs/{organism}.{ksize}.abundance.png"
+    shell: """
+        python scripts/plot-abundance-dist.py --ymax 100 {input.dist} {output.plot}
+    """
+
+rule nx_graph:
+    output: graph="outputs/{organism}.{ksize}.gml.gz"
+    input:
+        seqs="inputs/{organism}.fa.gz",
+        cg="outputs/{organism}.{ksize}.cg"
+    params: ksize="{ksize}"
+    run:
+
+        TRANSLATE = {'A': 'T', 'C': 'G', 'T': 'A', 'G': 'C'}
+        def revcomp(kmer):
+            return "".join(TRANSLATE[c] for c in kmer[::-1])
+
+        def lex_rc(kmer):
+            kmer = (kmer.upper()
+                        .replace("N", "A")
+                        .replace("M", "A")
+                        .replace("R", "A"))
+            rc = revcomp(kmer)
+            if kmer < rc:
+                return kmer
+            return rc
+
+        def kmers(seq, k):
+            for i in range(len(seq) - k):
+                yield seq[i:i+k]
+
+        def gstats(k, seqs, tablesize=1e6):
+            cg = khmer.load_countgraph(input.cg)
+
+            with gzip.open(seqs, 'r') as data:
+                g = nx.DiGraph()
+                for seq in screed.fasta.fasta_iter(data):
+                    for kmer in set(kmers(seq['sequence'], k)):
+                        kmerl = lex_rc(kmer)
+                        for nc in "ACGT":
+                            # right
+                            next_node = lex_rc(kmer[1:] + nc)
+                            weight_next = cg.get(next_node)
+                            if weight_next != 0:
+                                g.add_edge(kmerl, next_node)
+                                g.node[next_node]['weight'] = weight_next
+                                g.node[kmerl]['weight'] = cg.get(kmerl)
+
+                            #left
+                            next_node = lex_rc(nc + kmer[:-1])
+                            weight_next = cg.get(next_node)
+                            if weight_next != 0:
+                                g.add_edge(next_node, kmerl)
+                                g.node[next_node]['weight'] = weight_next
+                                g.node[kmerl]['weight'] = cg.get(kmerl)
+
+            total_mers = (4**k)/2
+            return g, (total_mers - cg.n_unique_kmers()) / total_mers
+
+        g, occ = gstats(int(params.ksize), input.seqs, 2e9)
+        nx.write_graphml(g, output.graph)
+
+rule nx_stats:
+    input: graph="outputs/{organism}.{ksize}.gml.gz"
+    output: stats="outputs/{organism}.{ksize}.stats"
+    run:
+        g = nx.read_graphml(input.graph)
+        g.name = "Directed version"
+        gu = g.to_undirected()
+        gu.name = "Undirected version"
+        with open(output.stats, 'w') as stats:
+            stats.write(nx.info(g) + "\n\n")
+            stats.write(nx.info(gu) + "\n\n")
+
+rule install_software:
+    output: "sw/spacegraphcats"
+    shell: """
+        mkdir -p sw
+        cd sw
+        git clone git@github.com:spacegraphcats/spacegraphcats
+    """
+
+rule compress_dbg:
+    input: "inputs/{organism}.fa.gz"
+    output: "outputs/cdbg/{organism}.{ksize}.gml.gz"
+    params: ksize="{ksize}"
+    shell: """
+        ./sw/spacegraphcats/spacegraphcats/walk-dbg.py -o {output} --gml \
+            -k {params.ksize} -x 1e9 {input}
     """
